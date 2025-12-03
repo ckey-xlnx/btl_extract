@@ -105,17 +105,19 @@ def extract(field_re: re.Pattern, text: str) -> Optional[str]:
 
 def process_ordered(parsed_lines: List[Dict[str, object]],
                     completed: List[AccessRecord],
-                    pending_reads: Dict[str, Dict[str, List[AccessRecord]]],
-                    pending_writes: Dict[str, Dict[str, List[AccessRecord]]]) -> None:
+                    pending_rreq: Dict[str, Dict[str, List[AccessRecord]]],
+                    pending_wrreq: Dict[str, Dict[str, List[AccessRecord]]],
+                    pending_wdata: Dict[str, List[str]]) -> None:
     """Process parsed & globally time-ordered lines.
 
     Pending structures are indexed first by interface then by transaction ID to avoid ID collisions across interfaces.
 
     For each (iface, ID) maintain a FIFO list (queue) of outstanding transactions:
-      - raddr_mon / waddr_mon pushes a fresh record into pending_reads[iface][rid] or pending_writes[iface][wid].
-      - rrsp_mon consumes head of pending_reads[iface][rid] when rlast=1 (appending intermediate rdata before final).
-      - wdata_mon appends to the most recent (largest req_ts) incomplete WRITE on that interface only.
-      - wrsp_mon finalizes and pops the head of pending_writes[iface][bid].
+      - raddr_mon pushes a fresh record into pending_rreq[iface][rid].
+      - rrsp_mon consumes head of pending_rreq[iface][rid] when rlast=1 (appending intermediate rdata before final).
+      - waddr_mon pushes a fresh record into pending_wrreq[iface][wid], claims any pending_wdata[iface].
+      - wdata_mon either appends to most recent incomplete WRITE in pending_wrreq, or stores in pending_wdata[iface].
+      - wrsp_mon finalizes and pops the head of pending_wrreq[iface][bid].
     """
     for parsed in parsed_lines:
         ts   = parsed['ts']
@@ -128,13 +130,13 @@ def process_ordered(parsed_lines: List[Dict[str, object]],
             addr = extract(ADDR_RE, rest)
             if rid and addr:
                 rec = AccessRecord(kind='READ', interface=iface, address=addr, req_ts=ts, txn_id=rid)
-                pending_reads.setdefault(iface, {}).setdefault(rid, []).append(rec)
+                pending_rreq.setdefault(iface, {}).setdefault(rid, []).append(rec)
 
         elif stream == 'rrsp_mon':
             rid = extract(RID_RE, rest)
-            if not rid or iface not in pending_reads or rid not in pending_reads[iface] or not pending_reads[iface][rid]:
+            if not rid or iface not in pending_rreq or rid not in pending_rreq[iface] or not pending_rreq[iface][rid]:
                 continue  # orphan response
-            rec = pending_reads[iface][rid][0]
+            rec = pending_rreq[iface][rid][0]
             rdata = extract(RDATA_RE, rest)
             rresp = extract(RRESP_RE, rest)
             rlast = extract(RLAST_RE, rest)
@@ -145,52 +147,65 @@ def process_ordered(parsed_lines: List[Dict[str, object]],
                 rec.rsp_status = rresp or 'UNKNOWN'
                 rec.complete = True
                 completed.append(rec)
-                pending_reads[iface][rid].pop(0)
-                if not pending_reads[iface][rid]:
-                    del pending_reads[iface][rid]
-                if not pending_reads[iface]:
-                    del pending_reads[iface]
+                pending_rreq[iface][rid].pop(0)
+                if not pending_rreq[iface][rid]:
+                    del pending_rreq[iface][rid]
+                if not pending_rreq[iface]:
+                    del pending_rreq[iface]
 
         elif stream == 'waddr_mon':
             wid = extract(WID_RE, rest)
             addr = extract(ADDR_RE, rest)
             if wid and addr:
                 rec = AccessRecord(kind='WRITE', interface=iface, address=addr, req_ts=ts, txn_id=wid)
-                pending_writes.setdefault(iface, {}).setdefault(wid, []).append(rec)
+                # Check if wdata arrived before wreq for this interface
+                if iface in pending_wdata:
+                    # Attach all pre-arrival write data to this request
+                    rec.write_data.extend(pending_wdata[iface])
+                    del pending_wdata[iface]
+                pending_wrreq.setdefault(iface, {}).setdefault(wid, []).append(rec)
 
         elif stream == 'wdata_mon':
             wdata = extract(WDATA_RE, rest)
-            if not wdata or iface not in pending_writes:
+            if not wdata:
                 continue
-            # Choose latest incomplete write on this interface only.
+
+            # Try to find a matching pending_wrreq on this interface
             candidate: Optional[AccessRecord] = None
-            latest_ts = -1
-            for wid_queue in pending_writes[iface].values():
-                if not wid_queue:
-                    continue
-                # Active record is last element in wid_queue until response.
-                last_rec = wid_queue[-1]
-                if (not last_rec.complete) and last_rec.req_ts > latest_ts:
-                    candidate = last_rec
-                    latest_ts = last_rec.req_ts
+            if iface in pending_wrreq:
+                # Choose latest incomplete write on this interface only.
+                latest_ts = -1
+                for wid_queue in pending_wrreq[iface].values():
+                    if not wid_queue:
+                        continue
+                    # Active record is last element in wid_queue until response.
+                    last_rec = wid_queue[-1]
+                    if (not last_rec.complete) and last_rec.req_ts > latest_ts:
+                        candidate = last_rec
+                        latest_ts = last_rec.req_ts
+
             if candidate:
                 candidate.write_data.append(wdata)
+            else:
+                # No matching wreq yet - store wdata for later
+                # When wreq arrives for this interface, it will claim all pending wdata
+                pending_wdata.setdefault(iface, []).append(wdata)
 
         elif stream == 'wrsp_mon':
             bid = extract(BID_RE, rest)
             bresp = extract(BRESP_RE, rest)
-            if not bid or iface not in pending_writes or bid not in pending_writes[iface] or not pending_writes[iface][bid]:
+            if not bid or iface not in pending_wrreq or bid not in pending_wrreq[iface] or not pending_wrreq[iface][bid]:
                 continue
-            rec = pending_writes[iface][bid][0]
+            rec = pending_wrreq[iface][bid][0]
             rec.rsp_ts = ts
             rec.rsp_status = bresp or 'UNKNOWN'
             rec.complete = True
             completed.append(rec)
-            pending_writes[iface][bid].pop(0)
-            if not pending_writes[iface][bid]:
-                del pending_writes[iface][bid]
-            if not pending_writes[iface]:
-                del pending_writes[iface]
+            pending_wrreq[iface][bid].pop(0)
+            if not pending_wrreq[iface][bid]:
+                del pending_wrreq[iface][bid]
+            if not pending_wrreq[iface]:
+                del pending_wrreq[iface]
 
 
 def format_record(rec: AccessRecord, iface_w: int, addr_w: int, ts_w: int) -> List[str]:
@@ -253,18 +268,20 @@ def main():
 
     completed: List[AccessRecord] = []
     # Indexed by interface -> ID -> queue[list] of AccessRecord
-    pending_reads: Dict[str, Dict[str, List[AccessRecord]]] = {}
-    pending_writes: Dict[str, Dict[str, List[AccessRecord]]] = {}
+    pending_rreq: Dict[str, Dict[str, List[AccessRecord]]] = {}
+    pending_wrreq: Dict[str, Dict[str, List[AccessRecord]]] = {}
+    # pending_wdata stores wdata that arrived before wreq: interface -> list of wdata values
+    pending_wdata: Dict[str, List[str]] = {}
 
-    process_ordered(parsed_lines, completed, pending_reads, pending_writes)
+    process_ordered(parsed_lines, completed, pending_rreq, pending_wrreq, pending_wdata)
 
     output_records: List[AccessRecord] = list(completed)
     if args.show_incomplete:
         # Flatten nested queues
-        for iface_map in pending_reads.values():
+        for iface_map in pending_rreq.values():
             for q in iface_map.values():
                 output_records.extend(q)
-        for iface_map in pending_writes.values():
+        for iface_map in pending_wrreq.values():
             for q in iface_map.values():
                 output_records.extend(q)
 
