@@ -47,6 +47,7 @@ RLAST_RE = re.compile(r"rlast:(\d)")
 WLAST_RE = re.compile(r"wlast:(\d)")
 RRESP_RE = re.compile(r"rresp:([A-Za-z0-9_]+)")
 BRESP_RE = re.compile(r"bresp:([A-Za-z0-9_]+)")
+LEN_RE = re.compile(r"len:(?:0x)?([0-9A-Fa-f]+)")
 
 @dataclass
 class AccessRecord:
@@ -55,6 +56,7 @@ class AccessRecord:
     address: str
     req_ts: int
     txn_id: str                # rid/wid (hex string)
+    expected_data_count: int = 1  # Number of data beats expected (len+1)
     write_data: List[str] = field(default_factory=list)
     read_data: List[str] = field(default_factory=list)
     rsp_ts: Optional[int] = None
@@ -128,8 +130,10 @@ def process_ordered(parsed_lines: List[Dict[str, object]],
         if stream == 'raddr_mon':
             rid = extract(RID_RE, rest)
             addr = extract(ADDR_RE, rest)
+            len_str = extract(LEN_RE, rest)
             if rid and addr:
-                rec = AccessRecord(kind='READ', interface=iface, address=addr, req_ts=ts, txn_id=rid)
+                expected_count = int(len_str, 16) + 1 if len_str else 1
+                rec = AccessRecord(kind='READ', interface=iface, address=addr, req_ts=ts, txn_id=rid, expected_data_count=expected_count)
                 pending_rreq.setdefault(iface, {}).setdefault(rid, []).append(rec)
 
         elif stream == 'rrsp_mon':
@@ -142,7 +146,8 @@ def process_ordered(parsed_lines: List[Dict[str, object]],
             rlast = extract(RLAST_RE, rest)
             if rdata:
                 rec.read_data.append(rdata)
-            if rlast == '1':
+            # Complete when we've received expected number of data beats or see rlast
+            if rlast == '1' or len(rec.read_data) >= rec.expected_data_count:
                 rec.rsp_ts = ts
                 rec.rsp_status = rresp or 'UNKNOWN'
                 rec.complete = True
@@ -156,13 +161,18 @@ def process_ordered(parsed_lines: List[Dict[str, object]],
         elif stream == 'waddr_mon':
             wid = extract(WID_RE, rest)
             addr = extract(ADDR_RE, rest)
+            len_str = extract(LEN_RE, rest)
             if wid and addr:
-                rec = AccessRecord(kind='WRITE', interface=iface, address=addr, req_ts=ts, txn_id=wid)
+                expected_count = int(len_str, 16) + 1 if len_str else 1
+                rec = AccessRecord(kind='WRITE', interface=iface, address=addr, req_ts=ts, txn_id=wid, expected_data_count=expected_count)
                 # Check if wdata arrived before wreq for this interface
                 if iface in pending_wdata:
-                    # Attach all pre-arrival write data to this request
-                    rec.write_data.extend(pending_wdata[iface])
-                    del pending_wdata[iface]
+                    # Attach pre-arrival write data up to expected count
+                    data_to_claim = min(len(pending_wdata[iface]), expected_count)
+                    rec.write_data.extend(pending_wdata[iface][:data_to_claim])
+                    pending_wdata[iface] = pending_wdata[iface][data_to_claim:]
+                    if not pending_wdata[iface]:
+                        del pending_wdata[iface]
                 pending_wrreq.setdefault(iface, {}).setdefault(wid, []).append(rec)
 
         elif stream == 'wdata_mon':
@@ -173,14 +183,14 @@ def process_ordered(parsed_lines: List[Dict[str, object]],
             # Try to find a matching pending_wrreq on this interface
             candidate: Optional[AccessRecord] = None
             if iface in pending_wrreq:
-                # Choose latest incomplete write on this interface only.
+                # Choose latest incomplete write on this interface that still needs data
                 latest_ts = -1
                 for wid_queue in pending_wrreq[iface].values():
                     if not wid_queue:
                         continue
                     # Active record is last element in wid_queue until response.
                     last_rec = wid_queue[-1]
-                    if (not last_rec.complete) and last_rec.req_ts > latest_ts:
+                    if (not last_rec.complete) and len(last_rec.write_data) < last_rec.expected_data_count and last_rec.req_ts > latest_ts:
                         candidate = last_rec
                         latest_ts = last_rec.req_ts
 
@@ -188,7 +198,7 @@ def process_ordered(parsed_lines: List[Dict[str, object]],
                 candidate.write_data.append(wdata)
             else:
                 # No matching wreq yet - store wdata for later
-                # When wreq arrives for this interface, it will claim all pending wdata
+                # When wreq arrives for this interface, it will claim pending wdata
                 pending_wdata.setdefault(iface, []).append(wdata)
 
         elif stream == 'wrsp_mon':
