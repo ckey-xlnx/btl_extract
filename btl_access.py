@@ -239,7 +239,12 @@ def main():
         if not os.path.isfile(path):
             print(f"WARNING: Skipping missing file {path}", file=sys.stderr)
             continue
-        for raw in run_btl2txt(args.btl2txt, path):
+        if path[-4:] == ".btl":
+            src = run_btl2txt(args.btl2txt, path)
+        else:
+            f = open(path)
+            src = f.readlines()
+        for raw in src:
             p = parse_line(raw)
             if p:
                 parsed_lines.append(p)
